@@ -1,0 +1,105 @@
+import os
+import uuid
+from typing import Optional, Dict, Any
+
+import httpx
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, Field
+
+app = FastAPI(title="Cerbero Executor (CEFI)")
+
+EXECUTOR_API_KEY = (os.getenv("EXECUTOR_API_KEY", "") or "").strip()
+
+def _check_key(got: Optional[str]):
+    if EXECUTOR_API_KEY and got != EXECUTOR_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid executor key")
+
+METAAPI_TOKEN = (os.getenv("METAAPI_TOKEN", "") or "").strip()
+METAAPI_ACCOUNT_ID = (os.getenv("METAAPI_ACCOUNT_ID", "") or "").strip()
+METAAPI_API_BASE = (os.getenv("METAAPI_API_BASE", "") or "https://mt-client-api-v1.new-york.agiliumtrade.ai").strip().rstrip("/")
+DEFAULT_VOLUME = float(os.getenv("DEFAULT_VOLUME", "0.01"))
+
+class ExecuteIn(BaseModel):
+    tenant_email: str
+    symbol: str
+    direction: str = Field(..., pattern="^(LONG|SHORT)$")
+    timeframe: Optional[str] = None
+    risk_pct: Optional[float] = None
+    strength_class: Optional[str] = None
+    ts_signal: Optional[str] = None
+    meta: Optional[Dict[str, Any]] = None
+
+@app.get("/ping", response_class=PlainTextResponse)
+def ping():
+    return "ok"
+
+@app.get("/healthz", response_class=PlainTextResponse)
+def healthz():
+    return "ok"
+
+@app.post("/v1/execute")
+async def v1_execute(
+    body: ExecuteIn,
+    x_executor_key: Optional[str] = Header(None, alias="X-Executor-Key"),
+):
+    _check_key(x_executor_key)
+
+    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+        raise HTTPException(status_code=500, detail="metaapi not configured (missing METAAPI_TOKEN or METAAPI_ACCOUNT_ID)")
+
+    symbol = (body.symbol or "").strip().upper()
+    direction = (body.direction or "").strip().upper()
+    if direction not in ("LONG", "SHORT"):
+        raise HTTPException(status_code=400, detail="direction must be LONG/SHORT")
+
+    vol = DEFAULT_VOLUME
+    try:
+        if body.meta and body.meta.get("volume_lots") is not None:
+            vol = float(body.meta.get("volume_lots"))
+    except Exception:
+        vol = DEFAULT_VOLUME
+
+    action_type = "ORDER_TYPE_BUY" if direction == "LONG" else "ORDER_TYPE_SELL"
+
+    trade_payload: Dict[str, Any] = {
+        "actionType": action_type,
+        "symbol": symbol,
+        "volume": vol,
+    }
+
+    if body.meta:
+        tp = body.meta.get("takeProfit") or body.meta.get("tp")
+        sl = body.meta.get("stopLoss") or body.meta.get("sl")
+        if tp is not None:
+            try: trade_payload["takeProfit"] = float(tp)
+            except Exception: pass
+        if sl is not None:
+            try: trade_payload["stopLoss"] = float(sl)
+            except Exception: pass
+
+    url = f"{METAAPI_API_BASE}/users/current/accounts/{METAAPI_ACCOUNT_ID}/trade"
+    headers = {
+        "Content-Type": "application/json",
+        "auth-token": METAAPI_TOKEN,
+        "X-Request-Id": str(uuid.uuid4()),
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(url, json=trade_payload, headers=headers)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw": r.text}
+
+    if r.status_code >= 300:
+        raise HTTPException(status_code=502, detail={"metaapi_http": r.status_code, "body": data})
+
+    return {
+        "ok": True,
+        "provider": "metaapi",
+        "status": "SUBMITTED",
+        "provider_order_id": str(data.get("orderId") or data.get("positionId") or data.get("dealId") or ""),
+        "echo": body.model_dump(),
+        "metaapi": data,
+    }
