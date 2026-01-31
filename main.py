@@ -20,6 +20,28 @@ METAAPI_ACCOUNT_ID = (os.getenv("METAAPI_ACCOUNT_ID", "") or "").strip()
 METAAPI_API_BASE = (os.getenv("METAAPI_API_BASE", "") or "https://mt-client-api-v1.new-york.agiliumtrade.ai").strip().rstrip("/")
 DEFAULT_VOLUME = float(os.getenv("DEFAULT_VOLUME", "0.01"))
 
+# ======================
+# RISK_BASED_POSITION_SIZING_V1_STRICT helpers
+# ======================
+def _spec_float(spec: dict, *keys):
+    for k in keys:
+        try:
+            if spec is None:
+                continue
+            v = spec.get(k)
+            if v is None:
+                continue
+            return float(v)
+        except Exception:
+            continue
+    return None
+
+def _round_to_step(x: float, step: float) -> float:
+    if step is None or step <= 0:
+        return float(x)
+    return float(round(float(x) / float(step)) * float(step))
+
+
 # Safety: minimum SL/TP distance fallback (in "ticks" when spec not available)
 FALLBACK_MIN_TICKS = int(os.getenv("FALLBACK_MIN_TICKS", "10"))
 
@@ -131,6 +153,26 @@ async def v1_execute(
 ):
     _check_key(x_executor_key)
 
+    # EXECUTOR_SAFE_MODE_REQUIRE_SLTP: rifiuta se SL/TP mancanti
+    EXECUTOR_SAFE_MODE_REQUIRE_SLTP = True
+    if EXECUTOR_SAFE_MODE_REQUIRE_SLTP:
+        _meta = body.meta or {}
+        _sl_abs = getattr(body, "sl", None)
+        _tp_abs = getattr(body, "tp", None)
+        _sl_dec = _meta.get("sl_pct_dec") or _meta.get("sl_pct")
+        _tp_dec = _meta.get("tp_pct_dec") or _meta.get("tp_pct")
+        if (_sl_abs is None and _sl_dec is None) or (_tp_abs is None and _tp_dec is None):
+            raise HTTPException(status_code=400, detail={
+                "code": "MISSING_SLTP",
+                "msg": "Safe-mode: SL/TP richiesti",
+                "sl_abs": _sl_abs,
+                "tp_abs": _tp_abs,
+                "sl_dec": _sl_dec,
+                "tp_dec": _tp_dec,
+            })
+
+    _check_key(x_executor_key)
+
     if not METAAPI_TOKEN:
         raise HTTPException(status_code=500, detail="metaapi not configured (missing METAAPI_TOKEN)")
 
@@ -138,14 +180,8 @@ async def v1_execute(
     direction = (body.direction or "").strip().upper()
     if direction not in ("LONG", "SHORT"):
         raise HTTPException(status_code=400, detail="direction must be LONG/SHORT")
-
-    vol = DEFAULT_VOLUME
-    try:
-        if body.meta and body.meta.get("volume_lots") is not None:
-            vol = float(body.meta.get("volume_lots"))
-    except Exception:
-        vol = DEFAULT_VOLUME
-
+    # volume_lots will be computed later (risk-based) or provided explicitly in meta.volume_lots
+    vol = None
     action_type = "ORDER_TYPE_BUY" if direction == "LONG" else "ORDER_TYPE_SELL"
 
     account_id = (body.provider_account_id or METAAPI_ACCOUNT_ID or "").strip()
@@ -216,6 +252,257 @@ async def v1_execute(
             abs_tp = _to_float(tp)
             abs_sl = _to_float(sl)
 
+
+        # ======================
+
+        # RISK_BASED_POSITION_SIZING_V1_STRICT
+
+        # ======================
+
+        # Istituzionale: o sizing risk-based (con risk_pct + SL), oppure rifiuta il trade.
+
+        meta = body.meta or {}
+
+        
+
+        # 1) Manual override (solo se fornito esplicitamente)
+
+        explicit_vol = None
+
+        try:
+
+            if meta.get("volume_lots") is not None:
+
+                explicit_vol = float(meta.get("volume_lots"))
+
+        except Exception:
+
+            explicit_vol = None
+
+        
+
+        if explicit_vol is not None:
+
+            vol = float(explicit_vol)
+
+        else:
+
+            # 2) Risk-based sizing
+
+            # risk_pct: body.risk_pct oppure meta.risk_pct
+
+            rp = body.risk_pct
+
+            if rp is None:
+
+                try:
+
+                    rp = float(meta.get("risk_pct")) if meta.get("risk_pct") is not None else None
+
+                except Exception:
+
+                    rp = None
+
+        
+
+            # equity: preferisci meta.equity_usd/balance_usd, altrimenti prova MetaApi account endpoint
+
+            equity = None
+
+            for k in ("equity_usd", "equity", "balance_usd", "balance"):
+
+                try:
+
+                    if meta.get(k) is not None:
+
+                        equity = float(meta.get(k))
+
+                        break
+
+                except Exception:
+
+                    pass
+
+        
+
+            if equity is None:
+
+                try:
+
+                    acc_url = f"{METAAPI_API_BASE}/users/current/accounts/{account_id}"
+
+                    acc = await _metaapi_get_json(client, acc_url, headers)
+
+                    for k in ("equity", "balance", "marginEquity"):
+
+                        try:
+
+                            if acc.get(k) is not None:
+
+                                equity = float(acc.get(k))
+
+                                break
+
+                        except Exception:
+
+                            pass
+
+                except Exception:
+
+                    equity = None
+
+        
+
+            # serve SL assoluto per distanza stop
+
+            if abs_sl is None or entry_ref is None:
+
+                raise HTTPException(status_code=400, detail={"code":"SIZING_NO_SL","msg":"Sizing richiede SL assoluto (abs_sl) e entry_ref"})
+
+        
+
+            stop_dist = abs(float(entry_ref) - float(abs_sl))
+
+            if stop_dist <= 0:
+
+                raise HTTPException(status_code=400, detail={"code":"SIZING_BAD_STOP","msg":"stop_dist non valido","stop_dist":stop_dist})
+
+        
+
+            # spec monetary fields (AvaTrade/MetaApi): tickValue spesso è NULL, usiamo contractSize (istituzionale)
+
+        
+
+            contract_size = _spec_float(spec, 'contractSize', 'contract_size', 'contractsize')
+
+        
+
+            if rp is None or equity is None or contract_size is None or contract_size <= 0:
+
+        
+
+                raise HTTPException(status_code=400, detail={
+
+        
+
+                    'code': 'SIZING_UNAVAILABLE',
+
+        
+
+                    'msg': 'Impossibile calcolare volume (mancano risk_pct/equity/spec contractSize)',
+
+        
+
+                    'risk_pct': rp,
+
+        
+
+                    'equity': equity,
+
+        
+
+                    'contractSize': contract_size,
+
+        
+
+                })
+
+        
+
+            
+
+        
+
+            risk_amount = float(equity) * float(rp)
+
+        
+
+            # FX/CFD model: PnL per 1 lot ≈ Δprice * contractSize (in profitCurrency)
+
+        
+
+            risk_per_lot = float(stop_dist) * float(contract_size)
+
+        
+
+            if risk_per_lot <= 0:
+
+        
+
+                raise HTTPException(status_code=400, detail={
+
+        
+
+                    'code': 'SIZING_BAD_RISK_PER_LOT',
+
+        
+
+                    'msg': 'risk_per_lot non valido',
+
+        
+
+                    'risk_per_lot': risk_per_lot,
+
+        
+
+                    'stop_dist': stop_dist,
+
+        
+
+                    'contractSize': contract_size,
+
+        
+
+                })
+
+        
+
+            
+
+        
+
+            lots = float(risk_amount) / float(risk_per_lot)
+
+        
+
+            
+
+        
+
+            # clamp/step best-effort
+
+            min_vol = _spec_float(spec, "minVolume", "min_volume", "minimumVolume")
+
+            max_vol = _spec_float(spec, "maxVolume", "max_volume", "maximumVolume")
+
+            step_vol = _spec_float(spec, "volumeStep", "volume_step", "stepVolume")
+
+        
+
+            if min_vol is not None:
+
+                lots = max(lots, float(min_vol))
+
+            if max_vol is not None:
+
+                lots = min(lots, float(max_vol))
+
+            if step_vol is not None and step_vol > 0:
+
+                lots = _round_to_step(lots, float(step_vol))
+
+        
+
+            if lots <= 0:
+
+                raise HTTPException(status_code=400, detail={"code":"SIZING_NONPOSITIVE","msg":"lots <= 0","lots":lots})
+
+        
+
+            vol = float(lots)
+
+        
+
         trade_payload: Dict[str, Any] = {
             "actionType": action_type,
             "symbol": symbol,
@@ -240,7 +527,8 @@ async def v1_execute(
         "ok": True,
         "provider": "metaapi",
         "status": "SUBMITTED",
-        "provider_order_id": str(data.get("orderId") or data.get("positionId") or data.get("dealId") or ""),
+        "provider_order_id": str(data.get("orderId") or ""),
+        "provider_position_id": str(data.get("positionId") or data.get("dealId") or ""),
         "echo": body.model_dump(),
         "metaapi": data,
         "risk_translation": {
@@ -251,5 +539,15 @@ async def v1_execute(
             "tp_pct": tp_pct,
             "computed": {"stopLoss": trade_payload.get("stopLoss"), "takeProfit": trade_payload.get("takeProfit")},
             "spec_hint": {"digits": digits, "tickSize": tick_size, "stopsLevel": stops_level, "min_dist": min_dist},
+              "spec_keys": sorted(list(spec.keys())) if isinstance(spec, dict) else [],
+              "spec_sample": {
+                  "tickValue": spec.get("tickValue") if isinstance(spec, dict) else None,
+                  "tickSize": spec.get("tickSize") if isinstance(spec, dict) else None,
+                  "contractSize": spec.get("contractSize") if isinstance(spec, dict) else None,
+                  "minVolume": spec.get("minVolume") if isinstance(spec, dict) else None,
+                  "maxVolume": spec.get("maxVolume") if isinstance(spec, dict) else None,
+                  "volumeStep": spec.get("volumeStep") if isinstance(spec, dict) else None,
+              },
+
         }
     }
